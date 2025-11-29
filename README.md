@@ -1,29 +1,72 @@
-
 # dockdns
 
-Small Python agent that:
+Automatic DNS + reverse proxy wiring for your home lab.
 
-- Discovers Docker containers with `dockdns.enable=true`
-- Derives domain from label or `<container_name>.<DOCKDNS_DOMAIN>`
-- Determines container IP + port (label or first exposed port)
-- Writes Traefik dynamic config (file provider)
-- (Placeholder) syncs DNS to Pi-hole
+`dockdns` runs **per host** and:
 
-## Quickstart with pyenv
+- Watches Docker containers with `dockdns.enable=true`.
+- Derives a domain for each container (e.g. `myapp.home.box`).
+- Writes Traefik dynamic config (file provider) to route HTTP traffic.
+- Manages Pi-hole DNS records so each domain points to the correct host IP.
+- Cleans up DNS when containers disappear.
+- Avoids stealing domains that are already owned by another host.
 
-```bash
-pyenv install 3.12.3   # or latest 3.x you like
-pyenv virtualenv 3.12.3 dockdns-venv
-pyenv local dockdns-venv
+Designed for setups like: NUC + TrueNAS + Raspberry Pis + Pi-hole, all under `*.home.box`.
 
-pip install -r requirements.txt
+---
 
-# test discovery (must be on a host with Docker)
-python agent.py
-```
+## Architecture
 
-Environment variables:
+Per host, you run a **combined container** that includes:
 
-- `DOCKDNS_DOMAIN` (default: `home.box`)
-- `DOCKDNS_TRAEFIK_FILE` (default: `/etc/traefik/dynamic/dockdns.yaml`)
-- `DOCKDNS_INTERVAL` (default: `15` seconds)
+- Traefik (reverse proxy)
+- dockdns agent (Python)
+
+### Components
+
+- **Pi-hole**
+  - Central DNS server (e.g. `192.168.50.240`).
+  - Manages `A` records like `app1.home.box -> 192.168.50.50`.
+
+- **dockdns agent (per host)**
+  - Talks to Docker via `/var/run/docker.sock`.
+  - Detects containers with `dockdns.enable=true`.
+  - For each such container:
+    - Domain:
+      - `dockdns.domain` label, or
+      - `<container_name>.<DOCKDNS_DOMAIN>` (e.g. `grafana.home.box`).
+    - Port:
+      - `dockdns.port` label, or
+      - first exposed port from `EXPOSE`/Docker config.
+  - Writes Traefik config under `/etc/traefik/dynamic/dockdns.yaml`.
+  - Talks to Pi-hole v6 API:
+    - Uses app token (application password) to `POST /api/auth` → SID.
+    - Uses SID for:
+      - `GET /api/config/dns/hosts` to list host entries.
+      - `PUT /api/config/dns/hosts/IP%20DOMAIN` to create entries.
+      - `DELETE /api/config/dns%2Fhosts/IP%20DOMAIN` to delete entries.
+
+### DNS Ownership Rules
+
+- Each host uses its **LAN IP** (`HOST_LAN_IP`).
+- For each container domain on this host:
+  - If domain is **unused** → create `HOST_LAN_IP domain`.
+  - If domain is already used by **this host IP** → keep it.
+  - If domain is already used by **another IP** → **do not** create/change it.
+- If dockdns previously created `HOST_LAN_IP some.domain` but no container on this host uses `some.domain` anymore → that DNS record is deleted.
+
+This prevents two hosts from claiming the same name and cleans up stale names when containers are removed.
+
+---
+
+## Labels
+
+On a container you want exposed:
+
+```yaml
+labels:
+  - "dockdns.enable=true"
+  # optional:
+  - "dockdns.domain=grafana.home.box"
+  # optional:
+  - "dockdns.port=3000"
