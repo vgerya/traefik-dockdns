@@ -24,8 +24,6 @@ TRAEFIK_DYNAMIC_FILE = Path(
 
 PIHOLE_URL = os.getenv("PIHOLE_URL")              # e.g. http://192.168.50.240
 PIHOLE_APP_TOKEN = os.getenv("PIHOLE_APP_TOKEN")  # app password from Pi-hole UI
-if not PIHOLE_APP_TOKEN:
-    raise RuntimeError("PIHOLE_APP_TOKEN not set")
 
 
 # -----------------------
@@ -506,6 +504,11 @@ def sync_pihole(containers, host_ip):
 # -----------------------
 
 def main_loop(interval=15):
+    if not PIHOLE_APP_TOKEN:
+        raise RuntimeError("PIHOLE_APP_TOKEN not set")
+    if not PIHOLE_URL:
+        raise RuntimeError("PIHOLE_URL not set")
+
     host_ip = get_host_lan_ip()
     print(f"[dockdns] Host LAN IP detected: {host_ip}")
     last_state = None
