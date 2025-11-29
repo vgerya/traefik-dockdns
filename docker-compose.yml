@@ -1,0 +1,40 @@
+version: "3.8"
+
+services:
+  traefik-dockdns:
+    build: .
+    container_name: traefik-dockdns
+    restart: unless-stopped
+
+    # Option A: classic Docker networking (recommended)
+    ports:
+      - "80:80"        # HTTP entrypoint
+      - "8080:8080"    # Traefik dashboard (we'll add router later if you want)
+
+    # Option B: uncomment to use host networking instead of ports
+    # network_mode: "host"
+
+    environment:
+      # dockdns config
+      DOCKDNS_DOMAIN: "home.box"
+      DOCKDNS_INTERVAL: "15"
+      # per-host LAN IP (used for Pi-hole A records)
+      HOST_LAN_IP: "192.168.50.240"
+
+      # Pi-hole app token auth
+      PIHOLE_URL: "http://192.168.50.240"
+      PIHOLE_APP_TOKEN: "ADD_ME"
+
+      # optional: override Traefik dynamic file path (matches agent default)
+      # DOCKDNS_TRAEFIK_FILE: "/etc/traefik/dynamic/dockdns.yaml"
+
+    volumes:
+      # so agent can see + inspect other containers on this host
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true
