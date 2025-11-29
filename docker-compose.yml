@@ -23,7 +23,7 @@ services:
 
       # Pi-hole app token auth
       PIHOLE_URL: "http://192.168.50.240"
-      PIHOLE_APP_TOKEN: "ADD_ME"
+      PIHOLE_APP_TOKEN: "${PIHOLE_APP_TOKEN:?PIHOLE_APP_TOKEN must be set}"
 
       # optional: override Traefik dynamic file path (matches agent default)
       # DOCKDNS_TRAEFIK_FILE: "/etc/traefik/dynamic/dockdns.yaml"

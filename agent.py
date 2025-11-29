@@ -24,6 +24,8 @@ TRAEFIK_DYNAMIC_FILE = Path(
 
 PIHOLE_URL = os.getenv("PIHOLE_URL")              # e.g. http://192.168.50.240
 PIHOLE_APP_TOKEN = os.getenv("PIHOLE_APP_TOKEN")  # app password from Pi-hole UI
+if not PIHOLE_APP_TOKEN:
+    raise RuntimeError("PIHOLE_APP_TOKEN not set")
 
 
 # -----------------------
@@ -176,8 +178,7 @@ def generate_traefik_config(containers):
     HTTP only, entryPoint 'web'.
     """
     if not containers:
-        # No HTTP config when no containers.
-        # Traefik is happy with an empty file / empty mapping.
+        # No dynamic HTTP config when no containers.
         return {}
 
     http_cfg = {
@@ -227,15 +228,12 @@ def write_traefik_config(containers):
 
     tmp_path = TRAEFIK_DYNAMIC_FILE.with_suffix(".yaml.tmp")
 
-    # When cfg is {}, Traefik simply treats it as "no dynamic HTTP config".
     with tmp_path.open("w") as f:
         yaml.safe_dump(cfg, f, default_flow_style=False)
 
-    # Atomic rename: Traefik will either see the old file or the new file, never a partial write
     tmp_path.replace(TRAEFIK_DYNAMIC_FILE)
 
     print(f"[dockdns] Wrote Traefik config to {TRAEFIK_DYNAMIC_FILE}")
-
 
 
 # -----------------------
@@ -249,15 +247,6 @@ def pihole_get_sid():
 
     POST /api/auth
     Body: {"password": "<app token>", "totp": null}
-
-    Expected JSON (simplified):
-      {
-        "session": {
-          "valid": true,
-          "sid": "...",
-          "message": "..."
-        }
-      }
     """
     if not PIHOLE_URL or not PIHOLE_APP_TOKEN:
         raise RuntimeError("PIHOLE_URL or PIHOLE_APP_TOKEN not set")
@@ -290,6 +279,69 @@ def pihole_get_sid():
         raise RuntimeError("Pi-hole /api/auth returned no SID")
 
     return sid
+
+
+def pihole_list_hosts(sid):
+    """
+    List all custom DNS host entries as (ip, domain) tuples.
+
+    GET /api/config/dns/hosts?sid=<SID>
+
+    Expected JSON (simplified):
+      {
+        "config": {
+          "dns": {
+            "hosts": [
+              "10.10.10.10 test",
+              "192.168.1.1 router.home"
+            ]
+          }
+        },
+        "took": ...
+      }
+    """
+    if not PIHOLE_URL:
+        return []
+
+    url = f"{PIHOLE_URL.rstrip('/')}/api/config/dns/hosts"
+    headers = {
+        "Accept": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    params = {"sid": sid}
+
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=5)
+        resp.raise_for_status()
+    except Exception as e:
+        print("[dockdns] Error fetching Pi-hole hosts:", e)
+        return []
+
+    try:
+        data = resp.json()
+    except ValueError as e:
+        print("[dockdns] Invalid JSON from Pi-hole hosts:", e, resp.text[:200])
+        return []
+
+    hosts_list = (
+        data.get("config", {})
+        .get("dns", {})
+        .get("hosts", [])
+    ) or []
+
+    result = []
+    for entry in hosts_list:
+        # Each entry is "IP domain"
+        if not isinstance(entry, str):
+            continue
+        parts = entry.split(" ", 1)
+        if len(parts) != 2:
+            continue
+        ip, domain = parts[0].strip(), parts[1].strip()
+        if ip and domain:
+            result.append((ip, domain))
+
+    return result
 
 
 def pihole_ensure_record(ip, domain, sid):
@@ -344,10 +396,60 @@ def pihole_ensure_record(ip, domain, sid):
         print(f"[dockdns] Error talking to Pi-hole for {domain} -> {ip}:", e)
 
 
+def pihole_delete_record(ip, domain, sid):
+    """
+    Delete Pi-hole DNS host record `ip domain`.
+
+    Uses generic config endpoint:
+      DELETE /api/config/dns%2Fhosts/{ip}%20{domain}?sid=<SID>
+    """
+    if not PIHOLE_URL:
+        print("[dockdns] PIHOLE_URL not set, skipping DNS delete")
+        return
+
+    element = quote("dns/hosts", safe="")  # -> dns%2Fhosts
+    value = quote(f"{ip} {domain}")
+    path = f"/api/config/{element}/{value}"
+    url = f"{PIHOLE_URL.rstrip('/')}{path}"
+
+    headers = {
+        "Accept": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    params = {"sid": sid}
+
+    try:
+        resp = requests.delete(url, headers=headers, params=params, timeout=5)
+
+        if resp.status_code in (200, 204):
+            print(f"[dockdns] Pi-hole host deleted: {domain} -> {ip}")
+            return
+
+        if resp.status_code == 404:
+            # Already gone – that's fine
+            print(f"[dockdns] Pi-hole host already absent: {domain} -> {ip}")
+            return
+
+        print(
+            f"[dockdns] Pi-hole DELETE failed for {domain} -> {ip}: "
+            f"{resp.status_code} {resp.text}"
+        )
+
+    except Exception as e:
+        print(f"[dockdns] Error deleting Pi-hole record {domain} -> {ip}:", e)
+
+
 def sync_pihole(containers, host_ip):
     """
-    For each dockdns-enabled container on this host, ensure Pi-hole has:
-        host_ip domain
+    Sync Pi-hole state for this host:
+
+    - For each container on this host, ensure:
+        domain -> host_ip
+      BUT:
+        * If the same domain already exists pointing to a different IP,
+          we DO NOT create a new record (avoid domain conflicts).
+    - For any existing record pointing to host_ip whose domain is no longer
+      used by any container on this host, delete it.
     """
     if not PIHOLE_URL or not PIHOLE_APP_TOKEN:
         print("[dockdns] Pi-hole not configured (PIHOLE_URL/PIHOLE_APP_TOKEN), skipping DNS sync")
@@ -360,9 +462,43 @@ def sync_pihole(containers, host_ip):
         print("[dockdns] Pi-hole auth failed:", e)
         return
 
+    existing = pihole_list_hosts(sid)
+    existing_pairs = set(existing)  # (ip, domain)
+
+    # domain -> set(ips)
+    domain_to_ips = {}
+    for ip, domain in existing:
+        domain_to_ips.setdefault(domain, set()).add(ip)
+
+    desired_domains = {c["domain"] for c in containers}
+
+    # 1) Upsert (respecting domain ownership)
     for c in containers:
         domain = c["domain"]
+        ips_for_domain = domain_to_ips.get(domain, set())
+
+        # If domain exists on another IP, don't steal it
+        if ips_for_domain and host_ip not in ips_for_domain:
+            print(
+                f"[dockdns] WARNING: Domain {domain} already used in Pi-hole "
+                f"for IP(s) {', '.join(sorted(ips_for_domain))}, "
+                f"skipping creation for {host_ip}"
+            )
+            continue
+
+        # Either the domain is new, or already bound to this host_ip
         pihole_ensure_record(host_ip, domain, sid)
+
+    # 2) Delete stale records belonging to this host
+    for ip, domain in existing_pairs:
+        if ip != host_ip:
+            continue
+        if domain in desired_domains:
+            continue
+
+        # This host previously owned this domain, but no container claims it now
+        print(f"[dockdns] Removing stale DNS record for {domain} -> {ip}")
+        pihole_delete_record(ip, domain, sid)
 
 
 # -----------------------
