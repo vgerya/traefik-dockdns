@@ -101,7 +101,7 @@ def _build_domain(container_name, labels):
     return f"{clean_name}.{DOCKDNS_DOMAIN}"
 
 
-def discover_dockdns_containers():
+def discover_dockdns_containers(client=None):
     """
     Discover containers that have dockdns.enable=true and gather:
       - domain
@@ -111,7 +111,7 @@ def discover_dockdns_containers():
       - name
       - id
     """
-    client = docker.from_env()
+    client = client or docker.from_env()
     containers = client.containers.list()
     result = []
 
@@ -164,6 +164,13 @@ def discover_dockdns_containers():
         })
 
     return result
+def _snapshot_state(containers):
+    """
+    Deterministic view of container state used to detect changes.
+    """
+    return sorted(
+        (c["domain"], c["container_ip"], c["port"]) for c in containers
+    )
 
 
 # -----------------------
@@ -503,7 +510,52 @@ def sync_pihole(containers, host_ip):
 # Main loop
 # -----------------------
 
-def main_loop(interval=15):
+def _should_handle_event(event):
+    """
+    Returns True if this Docker event should trigger a resync.
+    """
+    if not isinstance(event, dict):
+        return False
+
+    if event.get("Type") != "container":
+        return False
+
+    action = (event.get("Action") or "").lower()
+    watched = {
+        "start",
+        "stop",
+        "die",
+        "destroy",
+        "kill",
+        "pause",
+        "unpause",
+    }
+    return action in watched
+
+
+def _sync_all(host_ip, last_state=None, client=None):
+    """
+    Discover current containers, sync DNS + Traefik, and return new state snapshot.
+    """
+    containers = discover_dockdns_containers(client=client)
+    new_state = _snapshot_state(containers)
+
+    if new_state != last_state:
+        print("[dockdns] Changes detected, syncing...")
+        sync_pihole(containers, host_ip)
+        write_traefik_config(containers)
+    else:
+        print("[dockdns] No changes.")
+
+    return new_state
+
+
+def main_loop(_interval_unused=15):
+    """
+    Event-driven loop:
+      - initial full sync of running containers
+      - listen for container lifecycle events and resync when they occur
+    """
     if not PIHOLE_APP_TOKEN:
         raise RuntimeError("PIHOLE_APP_TOKEN not set")
     if not PIHOLE_URL:
@@ -511,27 +563,35 @@ def main_loop(interval=15):
 
     host_ip = get_host_lan_ip()
     print(f"[dockdns] Host LAN IP detected: {host_ip}")
-    last_state = None
+
+    client = docker.from_env()
+    last_state = _sync_all(host_ip, client=client)
 
     while True:
         try:
-            containers = discover_dockdns_containers()
-            new_state = sorted(
-                (c["domain"], c["container_ip"], c["port"]) for c in containers
-            )
+            print("[dockdns] Listening for Docker events (start/stop/die/destroy)...")
+            for event in client.events(decode=True, filters={"type": "container"}):
+                if not _should_handle_event(event):
+                    continue
 
-            if new_state != last_state:
-                print("[dockdns] Changes detected, syncing...")
-                sync_pihole(containers, host_ip)
-                write_traefik_config(containers)
-                last_state = new_state
-            else:
-                print("[dockdns] No changes.")
+                action = event.get("Action") or "unknown"
+                attrs = (event.get("Actor") or {}).get("Attributes") or {}
+                name = attrs.get("name") or "unknown"
+                print(f"[dockdns] Docker event: {action} for {name}")
 
+                last_state = _sync_all(host_ip, last_state=last_state, client=client)
+
+        except KeyboardInterrupt:
+            print("[dockdns] Stopping dockdns agent.")
+            return
         except Exception as e:
-            print("[dockdns] Error in main loop:", e)
-
-        time.sleep(interval)
+            print("[dockdns] Error while processing events, retrying in 5s:", e)
+            time.sleep(5)
+            try:
+                client = docker.from_env()
+            except Exception as conn_err:
+                print("[dockdns] Reconnecting to Docker failed:", conn_err)
+                time.sleep(5)
 
 
 if __name__ == "__main__":

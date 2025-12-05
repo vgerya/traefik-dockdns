@@ -183,3 +183,29 @@ def test_sync_pihole_deletes_stale_records(monkeypatch):
     # app1 should be ensured, app2 should be deleted
     assert (host_ip, "app1.home.box", "SID") in ensured
     assert (host_ip, "app2.home.box", "SID") in deleted
+
+
+def test_snapshot_state_sorted():
+    containers = [
+        {"domain": "b.example", "container_ip": "10.0.0.2", "port": 80},
+        {"domain": "a.example", "container_ip": "10.0.0.1", "port": 81},
+    ]
+
+    snapshot = agent._snapshot_state(containers)
+    assert snapshot == [
+        ("a.example", "10.0.0.1", 81),
+        ("b.example", "10.0.0.2", 80),
+    ]
+
+
+def test_should_handle_event_filters():
+    handle = {
+        "Type": "container",
+        "Action": "start",
+    }
+    ignore_wrong_type = {"Type": "network", "Action": "start"}
+    ignore_other_action = {"Type": "container", "Action": "exec_start"}
+
+    assert agent._should_handle_event(handle) is True
+    assert agent._should_handle_event(ignore_wrong_type) is False
+    assert agent._should_handle_event(ignore_other_action) is False
