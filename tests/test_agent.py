@@ -209,3 +209,30 @@ def test_should_handle_event_filters():
     assert agent._should_handle_event(handle) is True
     assert agent._should_handle_event(ignore_wrong_type) is False
     assert agent._should_handle_event(ignore_other_action) is False
+
+
+def test_status_api_reports_containers(monkeypatch):
+    containers = [
+        {
+            "id": "abc123",
+            "name": "my.app",
+            "domain": "my.app.home.box",
+            "port": 8080,
+            "container_ip": "172.18.0.5",
+            "network": "bridge",
+        }
+    ]
+
+    traefik_cfg = agent.generate_traefik_config(containers)
+    agent._set_status("192.168.1.1", containers, traefik_cfg)
+
+    app = agent.create_status_app()
+    client = app.test_client()
+    resp = client.get("/api/status")
+    assert resp.status_code == 200
+    data = resp.get_json()
+
+    assert data["host_ip"] == "192.168.1.1"
+    assert data["containers"][0]["name"] == "my.app"
+    assert data["containers"][0]["traefik"]["router"] == "my-app"
+    assert data["containers"][0]["traefik"]["rule"] == "Host(`my.app.home.box`)"

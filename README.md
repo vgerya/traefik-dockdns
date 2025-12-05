@@ -45,6 +45,7 @@ Per host, you run a **combined container** that includes:
       - `GET /api/config/dns/hosts` to list host entries.
       - `PUT /api/config/dns/hosts/IP%20DOMAIN` to create entries.
       - `DELETE /api/config/dns%2Fhosts/IP%20DOMAIN` to delete entries.
+  - Exposes a REST status API (`/api/status`) on port `8081` (configurable via `DOCKDNS_API_PORT`) showing running containers and their DNS/Traefik mapping.
 
 ### DNS Ownership Rules
 

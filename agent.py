@@ -1,6 +1,8 @@
+import json
 import os
 import time
 import subprocess
+import threading
 from pathlib import Path
 from urllib.parse import quote
 
@@ -24,6 +26,19 @@ TRAEFIK_DYNAMIC_FILE = Path(
 
 PIHOLE_URL = os.getenv("PIHOLE_URL")              # e.g. http://192.168.50.240
 PIHOLE_APP_TOKEN = os.getenv("PIHOLE_APP_TOKEN")  # app password from Pi-hole UI
+DOCKDNS_API_PORT = int(os.getenv("DOCKDNS_API_PORT", "8081"))
+
+# -----------------------
+# Shared status (for REST API)
+# -----------------------
+
+_status_lock = threading.Lock()
+_status_payload = {
+    "host_ip": None,
+    "containers": [],
+    "traefik": {},
+    "last_sync": None,
+}
 
 
 # -----------------------
@@ -164,6 +179,43 @@ def discover_dockdns_containers(client=None):
         })
 
     return result
+
+
+def _set_status(host_ip, containers, traefik_cfg):
+    """
+    Update shared status payload used by the REST API.
+    """
+    with _status_lock:
+        _status_payload["host_ip"] = host_ip
+        _status_payload["last_sync"] = time.time()
+        _status_payload["traefik"] = traefik_cfg
+
+        detailed = []
+        for c in containers:
+            name_slug = c["name"].replace(".", "-")
+            rule = f"Host(`{c['domain']}`)"
+            detailed.append({
+                "id": c["id"],
+                "name": c["name"],
+                "domain": c["domain"],
+                "port": c["port"],
+                "container_ip": c["container_ip"],
+                "network": c["network"],
+                "traefik": {
+                    "router": name_slug,
+                    "service": name_slug,
+                    "rule": rule,
+                    "target_url": f"http://{c['container_ip']}:{c['port']}",
+                },
+            })
+
+        _status_payload["containers"] = detailed
+
+
+def _get_status():
+    with _status_lock:
+        # Deep copy to avoid exposing internal dict references
+        return json.loads(json.dumps(_status_payload))
 def _snapshot_state(containers):
     """
     Deterministic view of container state used to detect changes.
@@ -171,6 +223,41 @@ def _snapshot_state(containers):
     return sorted(
         (c["domain"], c["container_ip"], c["port"]) for c in containers
     )
+
+
+def create_status_app():
+    """
+    Build the Flask app that exposes current dockdns state.
+    """
+    from flask import Flask, jsonify
+
+    app = Flask(__name__)
+
+    @app.get("/api/status")
+    def api_status():
+        return jsonify(_get_status())
+
+    return app
+
+
+def start_status_api(port):
+    """
+    Start REST API server in a background thread.
+    """
+    app = create_status_app()
+
+    def _run():
+        app.run(
+            host="0.0.0.0",
+            port=port,
+            debug=False,
+            use_reloader=False,
+        )
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    print(f"[dockdns] Status API listening on 0.0.0.0:{port}/api/status")
+    return thread
 
 
 # -----------------------
@@ -221,14 +308,14 @@ def generate_traefik_config(containers):
     return {"http": http_cfg}
 
 
-def write_traefik_config(containers):
+def write_traefik_config(containers, cfg=None):
     """
     Write the Traefik dynamic configuration file atomically.
 
     - If there are no containers, writes a minimal, valid config (or empty mapping).
     - Uses a temp file + atomic rename so Traefik never sees a half-written file.
     """
-    cfg = generate_traefik_config(containers)
+    cfg = cfg if cfg is not None else generate_traefik_config(containers)
     TRAEFIK_DYNAMIC_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     tmp_path = TRAEFIK_DYNAMIC_FILE.with_suffix(".yaml.tmp")
@@ -538,12 +625,14 @@ def _sync_all(host_ip, last_state=None, client=None):
     Discover current containers, sync DNS + Traefik, and return new state snapshot.
     """
     containers = discover_dockdns_containers(client=client)
+    traefik_cfg = generate_traefik_config(containers)
+    _set_status(host_ip, containers, traefik_cfg)
     new_state = _snapshot_state(containers)
 
     if new_state != last_state:
         print("[dockdns] Changes detected, syncing...")
         sync_pihole(containers, host_ip)
-        write_traefik_config(containers)
+        write_traefik_config(containers, cfg=traefik_cfg)
     else:
         print("[dockdns] No changes.")
 
@@ -565,6 +654,7 @@ def main_loop(_interval_unused=15):
     print(f"[dockdns] Host LAN IP detected: {host_ip}")
 
     client = docker.from_env()
+    start_status_api(DOCKDNS_API_PORT)
     last_state = _sync_all(host_ip, client=client)
 
     while True:
