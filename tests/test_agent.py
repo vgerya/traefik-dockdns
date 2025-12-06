@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -57,7 +58,7 @@ def test_generate_traefik_config_single():
     assert servers == [{"url": "http://172.18.0.5:8080"}]
 
 
-def test_sync_pihole_adds_records_for_this_host(monkeypatch):
+def test_sync_pihole_adds_records_for_this_host(monkeypatch, tmp_path):
     """
     If no DNS records exist yet, sync_pihole should create records for this host.
     """
@@ -82,6 +83,7 @@ def test_sync_pihole_adds_records_for_this_host(monkeypatch):
 
     def fake_ensure(ip, domain, sid):
         created.append((ip, domain, sid))
+        return True
 
     def fake_delete(ip, domain, sid):
         raise AssertionError("delete should not be called in this scenario")
@@ -91,15 +93,21 @@ def test_sync_pihole_adds_records_for_this_host(monkeypatch):
     monkeypatch.setattr(agent, "pihole_ensure_record", fake_ensure)
     monkeypatch.setattr(agent, "pihole_delete_record", fake_delete)
 
+    state_file = tmp_path / "state.json"
+    monkeypatch.setattr(agent, "DOCKDNS_STATE_FILE", state_file)
+
     agent.sync_pihole(containers, host_ip)
 
     assert set(created) == {
         (host_ip, "app1.home.box", "SID"),
         (host_ip, "app2.home.box", "SID"),
     }
+    # state file should record managed domains
+    data = json.loads(state_file.read_text())
+    assert set(data["managed_domains"]) == {"app1.home.box", "app2.home.box"}
 
 
-def test_sync_pihole_does_not_steal_domain(monkeypatch):
+def test_sync_pihole_does_not_steal_domain(monkeypatch, tmp_path):
     """
     If a domain already belongs to a different IP, this host should not claim it.
     """
@@ -132,6 +140,8 @@ def test_sync_pihole_does_not_steal_domain(monkeypatch):
     monkeypatch.setattr(agent, "pihole_ensure_record", fake_ensure)
     monkeypatch.setattr(agent, "pihole_delete_record", fake_delete)
 
+    monkeypatch.setattr(agent, "DOCKDNS_STATE_FILE", tmp_path / "state.json")
+
     agent.sync_pihole(containers, host_ip)
 
     # No record should be created for this host
@@ -140,7 +150,7 @@ def test_sync_pihole_does_not_steal_domain(monkeypatch):
     assert deleted == []
 
 
-def test_sync_pihole_deletes_stale_records(monkeypatch):
+def test_sync_pihole_deletes_stale_records(monkeypatch, tmp_path):
     """
     If a domain for this host exists but the container is gone,
     sync_pihole should delete the DNS record.
@@ -169,20 +179,64 @@ def test_sync_pihole_deletes_stale_records(monkeypatch):
 
     def fake_ensure(ip, domain, sid):
         ensured.append((ip, domain, sid))
+        return True
 
     def fake_delete(ip, domain, sid):
         deleted.append((ip, domain, sid))
+        return True
 
     monkeypatch.setattr(agent, "pihole_get_sid", fake_get_sid)
     monkeypatch.setattr(agent, "pihole_list_hosts", fake_list_hosts)
     monkeypatch.setattr(agent, "pihole_ensure_record", fake_ensure)
     monkeypatch.setattr(agent, "pihole_delete_record", fake_delete)
 
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"managed_domains": ["app1.home.box", "app2.home.box"]}))
+    monkeypatch.setattr(agent, "DOCKDNS_STATE_FILE", state_file)
+
     agent.sync_pihole(containers, host_ip)
 
     # app1 should be ensured, app2 should be deleted
     assert (host_ip, "app1.home.box", "SID") in ensured
     assert (host_ip, "app2.home.box", "SID") in deleted
+
+    # state should retain only app1
+    data = json.loads(state_file.read_text())
+    assert data["managed_domains"] == ["app1.home.box"]
+
+
+def test_sync_pihole_leaves_unmanaged_records(monkeypatch, tmp_path):
+    """
+    Manual record pointing to host_ip should not be removed if agent never created it.
+    """
+    host_ip = "192.168.50.50"
+    containers = []  # no containers claim the domain
+
+    monkeypatch.setattr(agent, "PIHOLE_URL", "http://pihole")
+    monkeypatch.setattr(agent, "PIHOLE_APP_TOKEN", "token")
+
+    deleted = []
+
+    def fake_get_sid():
+        return "SID"
+
+    def fake_list_hosts(sid):
+        # Manual record exists for this host IP
+        return [(host_ip, "nuc.home.box")]
+
+    def fake_delete(ip, domain, sid):
+        deleted.append((ip, domain, sid))
+        return True
+
+    monkeypatch.setattr(agent, "pihole_get_sid", fake_get_sid)
+    monkeypatch.setattr(agent, "pihole_list_hosts", fake_list_hosts)
+    monkeypatch.setattr(agent, "pihole_delete_record", fake_delete)
+    monkeypatch.setattr(agent, "DOCKDNS_STATE_FILE", tmp_path / "state.json")
+
+    agent.sync_pihole(containers, host_ip)
+
+    # Manual record should be untouched
+    assert deleted == []
 
 
 def test_snapshot_state_sorted():

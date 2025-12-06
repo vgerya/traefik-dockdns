@@ -27,6 +27,9 @@ TRAEFIK_DYNAMIC_FILE = Path(
 PIHOLE_URL = os.getenv("PIHOLE_URL")              # e.g. http://192.168.50.240
 PIHOLE_APP_TOKEN = os.getenv("PIHOLE_APP_TOKEN")  # app password from Pi-hole UI
 DOCKDNS_API_PORT = int(os.getenv("DOCKDNS_API_PORT", "8081"))
+DOCKDNS_STATE_FILE = Path(
+    os.getenv("DOCKDNS_STATE_FILE", "/etc/traefik/dockdns-state.json")
+)
 
 # -----------------------
 # Shared status (for REST API)
@@ -216,6 +219,37 @@ def _get_status():
     with _status_lock:
         # Deep copy to avoid exposing internal dict references
         return json.loads(json.dumps(_status_payload))
+
+
+# -----------------------
+# State tracking (managed domains)
+# -----------------------
+
+def _load_managed_domains():
+    try:
+        with DOCKDNS_STATE_FILE.open() as f:
+            data = json.load(f)
+            return set(data.get("managed_domains", []))
+    except FileNotFoundError:
+        return set()
+    except Exception as e:
+        print(f"[dockdns] Warning: could not read {DOCKDNS_STATE_FILE}: {e}")
+        return set()
+
+
+def _save_managed_domains(domains):
+    try:
+        DOCKDNS_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = DOCKDNS_STATE_FILE.with_suffix(".tmp")
+        payload = {
+            "managed_domains": sorted(domains),
+            "updated_at": time.time(),
+        }
+        with tmp.open("w") as f:
+            json.dump(payload, f)
+        tmp.replace(DOCKDNS_STATE_FILE)
+    except Exception as e:
+        print(f"[dockdns] Warning: could not write {DOCKDNS_STATE_FILE}: {e}")
 def _snapshot_state(containers):
     """
     Deterministic view of container state used to detect changes.
@@ -556,6 +590,7 @@ def sync_pihole(containers, host_ip):
 
     existing = pihole_list_hosts(sid)
     existing_pairs = set(existing)  # (ip, domain)
+    managed_domains = _load_managed_domains()
 
     # domain -> set(ips)
     domain_to_ips = {}
@@ -579,7 +614,8 @@ def sync_pihole(containers, host_ip):
             continue
 
         # Either the domain is new, or already bound to this host_ip
-        pihole_ensure_record(host_ip, domain, sid)
+        if pihole_ensure_record(host_ip, domain, sid):
+            managed_domains.add(domain)
 
     # 2) Delete stale records belonging to this host
     for ip, domain in existing_pairs:
@@ -590,7 +626,13 @@ def sync_pihole(containers, host_ip):
 
         # This host previously owned this domain, but no container claims it now
         print(f"[dockdns] Removing stale DNS record for {domain} -> {ip}")
-        pihole_delete_record(ip, domain, sid)
+        if domain not in managed_domains:
+            # Never created by this agent, leave it alone
+            continue
+        if pihole_delete_record(ip, domain, sid):
+            managed_domains.discard(domain)
+
+    _save_managed_domains(managed_domains)
 
 
 # -----------------------

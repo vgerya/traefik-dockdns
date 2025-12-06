@@ -46,6 +46,7 @@ Per host, you run a **combined container** that includes:
       - `PUT /api/config/dns/hosts/IP%20DOMAIN` to create entries.
       - `DELETE /api/config/dns%2Fhosts/IP%20DOMAIN` to delete entries.
   - Exposes a REST status API (`/api/status`) on port `8081` (configurable via `DOCKDNS_API_PORT`) showing running containers and their DNS/Traefik mapping.
+  - Tracks which domains it created in Pi-hole (state file: `DOCKDNS_STATE_FILE`, default `/etc/traefik/dockdns-state.json`) and only deletes DNS records it previously created. Manual entries are left untouched.
 
 ### DNS Ownership Rules
 
